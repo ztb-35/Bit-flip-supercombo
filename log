@@ -1,0 +1,7 @@
+/home/taibiaozhao/anaconda3/envs/torchAuto/bin/python /home/taibiaozhao/Openpilot-Deepdive/suercombo_importance.py 
+train samples: 12 val samples: 13
+[Load] loading openpilot_model/supercombo_torch_weights.pth
+[Eval] baseline traj loss: 102.548448
+[Importance] mode=gradxw, batches=8
+[Flip] flipped bit 10 in 100 elements.
+[Eval] post-flip traj loss: 323.616864 (Δ=+221.068416)
