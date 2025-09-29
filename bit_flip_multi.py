@@ -215,8 +215,8 @@ def bitflip_inplace_and_log(param: torch.Tensor,
     for fi in idx_cpu:
         old_f = float(fview[fi])
         old_i = int(iview[fi])
-        iview[fi] = old_i ^ int(mask)
-        new_f = float(fview[fi])
+        iview[fi] = old_i ^ int(mask)#flip int view
+        new_f = float(fview[fi])#float view also be flipped
         flips.append({
             "name": param_name,
             "bit": int(bit),
