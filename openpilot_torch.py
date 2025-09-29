@@ -399,6 +399,7 @@ class OpenPilotModel(nn.Module):
         plan, lead, lead_prob, lane_lines_prob, desire_state, lane_group1, lane_group2 = self.temporal_policy(ts_out)
 
         # concat final outputs
+        # #Lane_group1 is (lane1,2,3,4), lane_group2 is (lane0,5)
         out = torch.concat(
             (plan, lane_group1, lane_lines_prob, lane_group2, lead, lead_prob, desire_state, meta, desire_pred, pose,
              rnn_out), axis=1)

@@ -6,6 +6,7 @@ from typing import List, Tuple, Dict
 import numpy as np
 import torch
 import torch.nn as nn
+from numpy.array_api import squeeze
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -13,46 +14,38 @@ from tqdm import tqdm
 from openpilot_torch import OpenPilotModel
 from data import Comma2k19SequenceDataset
 
-# ========= Trajectory head slices (from your torch port) =========
-TRAJ_X_IDXS = list(range(5755, 5779, 4))   # 6 x-waypoints as validated in your file
-TRAJ_Y_IDXS = list(range(5756, 5780, 4))   # 6 y-waypoints
-K = len(TRAJ_X_IDXS)
-
-# ========= Optional index-class head (unused unless you want CE) =========
-IDX_CLS_SLICE = slice(6010, 6013)
-
-# ----------------- helpers -----------------
-def pick_traj(out: torch.Tensor) -> torch.Tensor:
-    """ out: (B, 6609) -> traj: (B, K, 2) """
-    x = out[:, TRAJ_X_IDXS]
-    y = out[:, TRAJ_Y_IDXS]
-    return torch.stack([x, y], dim=-1)
-
-def make_supercombo_inputs(batch: Dict[str, torch.Tensor], device: torch.device):
+distance_func = nn.CosineSimilarity(dim=2)
+cls_loss = nn.CrossEntropyLoss()
+reg_loss = nn.SmoothL1Loss(reduction='none')
+def make_supercombo_inputs(batch, device, K: int = 33, target_coord: str = "y"):
     """
-    Expects Comma2k19SequenceDataset batch with keys:
-      - 'seq_input_img': (B,T,C,H,W)  (C is 6 or 12 depending on preprocessing)
-      - 'seq_future_poses': (B,T,num_pts,3) with (x,y,psi)
-    Returns a single timestep (the last) shaped for supercombo forward.
+    batch:
+      - 'seq_input_img': (B,T,C,H,W)  (C = 6 or 12)
+      - 'seq_future_poses': (B,T,K,3) with (x, y, psi) or (x, y, z)
+    returns:
+      imgs12:   (B,12,H,W)
+      desire:   (B,8)
+      traffic:  (B,2)
+      h0:       (B,512)
+      traj_gt:  (B,K,15)  scalar target grid for plan head (one scalar per lattice cell)
     """
-    seq_imgs = batch['seq_input_img'].to(device, non_blocking=True)      # (B,T,C,H,W)
-    seq_labels = batch['seq_future_poses'].to(device, non_blocking=True) # (B,T,N,3)
+    seq_imgs   = batch['seq_input_img'].to(device, non_blocking=True)      # (B,T,C,H,W)
+    seq_labels = batch['seq_future_poses'].to(device, non_blocking=True)   # (B,T,K,3)
 
     B, T, C, H, W = seq_imgs.shape
-    # supercombo expects 12 channels; if your dataset outputs 6, tile as a stopgap
+    # supercombo expects 12 channels; if we have 6 (paired RGB), tile as a stopgap
     if C == 6:
         seq_imgs = torch.cat([seq_imgs, seq_imgs], dim=2)  # (B,T,12,H,W)
 
-    imgs12 = seq_imgs[:, -1]                     # take last step: (B,12,H,W)
-    desire = torch.zeros((B, 8), device=device)  # zeros are fine
+    imgs12  = seq_imgs[:, -1]                               # (B,12,H,W)
+    desire  = torch.zeros((B, 8),   device=device)
     traffic = torch.tensor([[1., 0.]], device=device).repeat(B, 1)
-    h0 = torch.zeros((B, 512), device=device)
+    h0      = torch.zeros((B, 512), device=device)
 
-    # labels: use first K waypoints (x,y) for that last step
-    traj_gt = seq_labels[:, -1, :K, :2]         # (B,K,2)
+    traj_gt = seq_labels[:,-1,:,:].squeeze(1)
+
     return imgs12, desire, traffic, h0, traj_gt
 
-# ----------------- importance metrics -----------------
 def score_tensor(p: torch.Tensor, mode: str) -> torch.Tensor:
     """
     Returns a tensor of scores same shape as p (no grad).
@@ -99,15 +92,37 @@ def accumulate_importance(model: nn.Module, data_loader: DataLoader,
         except StopIteration:
             break
 
-        imgs12, desire, traffic, h0, traj_gt = make_supercombo_inputs(batch, device)
+        imgs12, desire, traffic, h0, gt = make_supercombo_inputs(batch, device)
         # clear grads
         for p in model.parameters():
             p.grad = None
 
         with torch.cuda.amp.autocast(enabled=use_amp):
-            out = model(imgs12, desire, traffic, h0)   # (B,6609)
-            traj_pred = pick_traj(out)                 # (B,K,2)
-            loss = traj_loss_fn(traj_pred, traj_gt)
+            out = model(imgs12, desire, traffic, h0)  # (B, 6690) in your setup
+            B = out.shape[0]
+            plan = out[:, :5 * 991].view(B, 5, 991)  # (B,5,991)
+
+            pred_cls = plan[:, :, -1]  # (B,5)
+            params_flat = plan[:, :, :-1]  # (B,5,990)
+            pred_trajectory = params_flat.view(B, 5, 2, 33, 15)  # 2=(mean,std_param)
+            pred_trajectory = pred_trajectory[:, :, 0, :, :3]
+            assert len(pred_cls) == len(pred_trajectory) == len(gt)
+            with torch.no_grad():
+                # step 1: calculate distance between gt and each prediction
+                pred_end_positions = pred_trajectory[:, :, 32, :]  # B, M, 3
+                gt_end_positions = gt[:, 32:, :].expand(-1, 5, -1)  # B, 1, 3 -> B, M, 3
+
+                distances = 1 - distance_func(pred_end_positions, gt_end_positions)  # B, M
+                index = distances.argmin(dim=1)  # B
+
+            gt_cls = index
+            pred_trajectory = pred_trajectory[
+                torch.tensor(range(len(gt_cls)), device=gt_cls.device), index, ...]  # B, num_pts, 3
+
+            cls_loss_ = cls_loss(pred_cls, gt_cls)
+
+            reg_loss_ = reg_loss(pred_trajectory, gt).mean(dim=(0, 1))
+            loss = cls_loss_ + reg_loss_.mean()
 
         scaler.scale(loss).backward()
         scaler.step(torch.optim.SGD(model.parameters(), lr=0.0))  # dummy step to satisfy scaler
@@ -227,24 +242,53 @@ def load_weights(model, ckpt_path: str):
         new_sd = OrderedDict((k.replace('module.', ''), v) for k, v in sd.items())
         model.load_state_dict(new_sd, strict=False)
 
-def evaluate_loss(model, data_loader, device, num_batches=5, use_amp=True):
-    traj_loss_fn = nn.SmoothL1Loss()
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+def evaluate_loss_mdn(model, data_loader, device, num_batches: int = 5, use_amp: bool = True):
+    """
+    Expects make_supercombo_inputs(...)-> traj_gt of shape (B,33,15)
+    Model output is the full supercombo vector; we slice the first 5*991 for plan head.
+    """
     model.eval()
     losses = []
+    it = iter(data_loader)
     with torch.no_grad():
-        it = iter(data_loader)
-        for b in range(num_batches):
+        for _ in range(num_batches):
             try:
                 batch = next(it)
             except StopIteration:
                 break
-            imgs12, desire, traffic, h0, traj_gt = make_supercombo_inputs(batch, device)
+
+            # gt: (B,33,15)  scalar grid
+            imgs12, desire, traffic, h0, gt = make_supercombo_inputs(batch, device)
+
             with torch.cuda.amp.autocast(enabled=use_amp):
-                out = model(imgs12, desire, traffic, h0)
-                traj_pred = pick_traj(out)
-                loss = traj_loss_fn(traj_pred, traj_gt)
+                out  = model(imgs12, desire, traffic, h0)        # (B, 6690) in your setup
+                B    = out.shape[0]
+                plan = out[:, :5 * 991].view(B, 5, 991)          # (B,5,991)
+
+                pred_cls = plan[:, :, -1]                      # (B,5)
+                params_flat = plan[:, :, :-1]                     # (B,5,990)
+                pred_trajectory = params_flat.view(B, 5, 2, 33, 15)   # 2=(mean,std_param)
+                pred_trajectory = pred_trajectory[:,:,0,:,:3]
+                assert len(pred_cls) == len(pred_trajectory) == len(gt)
+                with torch.no_grad():
+                    # step 1: calculate distance between gt and each prediction
+                    pred_end_positions = pred_trajectory[:, :, 32, :]  # B, M, 3
+                    gt_end_positions = gt[:, 32:, :].expand(-1, 5, -1)  # B, 1, 3 -> B, M, 3
+
+                    distances = 1 - distance_func(pred_end_positions, gt_end_positions)  # B, M
+                    index = distances.argmin(dim=1)  # B
+
+                gt_cls = index
+                pred_trajectory = pred_trajectory[
+                    torch.tensor(range(len(gt_cls)), device=gt_cls.device), index, ...]  # B, num_pts, 3
+
+                cls_loss_ = cls_loss(pred_cls, gt_cls)
+
+                reg_loss_ = reg_loss(pred_trajectory, gt).mean(dim=(0, 1))
+                loss = cls_loss_ + reg_loss_.mean()
+
             losses.append(loss.item())
+
     return float(np.mean(losses)) if losses else float('nan')
 
 def parse_args():
@@ -259,6 +303,7 @@ def parse_args():
                    choices=['w','grad','gradxw','taylor1','fisher'])
     p.add_argument('--calib_batches', type=int, default=8,
                    help='how many mini-batches to accumulate for importance')
+    p.add_argument('--K', type=int, default=100, help='how many scalar weights to flip')
     p.add_argument('--topk',        type=int, default=100, help='how many scalar weights to flip')
     p.add_argument('--bit',         type=int, default=10,  help='which bit to flip (0..31 for float32)')
     p.add_argument('--restrict',    type=str, default='',
@@ -282,7 +327,8 @@ def main():
     load_weights(model, args.ckpt)
 
     # baseline loss
-    base_loss = evaluate_loss(model, val_loader, device, num_batches=5, use_amp=args.amp)
+    #base_loss = evaluate_loss(model, val_loader, device, num_batches=5, use_amp=args.amp)
+    base_loss = evaluate_loss_mdn(model, val_loader, device, num_batches=5, use_amp=args.amp)
     print(f"[Eval] baseline traj loss: {base_loss:.6f}")
 
     # accumulate importance
@@ -292,12 +338,14 @@ def main():
                                 mode=args.mode, use_amp=args.amp)
 
     # select & flip
-    flipped = select_and_flip(model, imp, topk=args.topk, bit=args.bit, restrict_to=restrict_to)
-    print(f"[Flip] flipped bit {args.bit} in {flipped} elements.")
+    for args.bit in [31, 30, 29, 23, 22, 21, 0]:
+        flipped = select_and_flip(model, imp, topk=args.topk, bit=args.bit, restrict_to=restrict_to)
+        print(f"[Flip] flipped bit {args.bit} in {flipped} elements.")
 
-    # post-flip loss
-    post_loss = evaluate_loss(model, val_loader, device, num_batches=5, use_amp=args.amp)
-    print(f"[Eval] post-flip traj loss: {post_loss:.6f} (Δ={post_loss - base_loss:+.6f})")
+        # post-flip loss
+        #post_loss = evaluate_loss(model, val_loader, device, num_batches=5, use_amp=args.amp)
+        post_loss = evaluate_loss_mdn(model, val_loader, device, num_batches=5, use_amp=args.amp)
+        print(f"[Eval] post-flip traj loss: {post_loss:.6f} (Δ={post_loss - base_loss:+.6f})")
 
 if __name__ == "__main__":
     main()
