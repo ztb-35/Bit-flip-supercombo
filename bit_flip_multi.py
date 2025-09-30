@@ -17,6 +17,7 @@ from datetime import datetime
 # ---- your project imports ----
 from openpilot_torch import OpenPilotModel
 from data import Comma2k19SequenceDataset
+from transfer_onnx_compare import export_to_onnx
 
 # ----------------- tiny tee logger (capture stdout+stderr but still print) -----------------
 class _Tee:
@@ -215,8 +216,8 @@ def bitflip_inplace_and_log(param: torch.Tensor,
     for fi in idx_cpu:
         old_f = float(fview[fi])
         old_i = int(iview[fi])
-        iview[fi] = old_i ^ int(mask)#flip int view
-        new_f = float(fview[fi])#float view also be flipped
+        iview[fi] = old_i ^ int(mask)
+        new_f = float(fview[fi])
         flips.append({
             "name": param_name,
             "bit": int(bit),
@@ -397,34 +398,26 @@ def export_flipped_model_onnx(model: nn.Module,
     except StopIteration:
         raise RuntimeError("val_loader is empty; need one batch to infer input shapes for ONNX export.")
 
-    imgs12, desire, traffic, h0, _ = make_supercombo_inputs(batch, device_cpu)
+    imgs = torch.randn(1, 12, 128, 256, dtype=torch.float32)
+    desire = torch.zeros(1, 8, dtype=torch.float32)
+    traffic = torch.tensor([[1.0, 0.0]], dtype=torch.float32)
+    h0 = torch.zeros(1, 512, dtype=torch.float32)
 
     # ensure eval + CPU for export
     model.eval()
     model_cpu = model.to(device_cpu)
 
-    # dynamic batch axis
-    dynamic_axes = {
-        "imgs12":  {0: "batch"},
-        "desire":  {0: "batch"},
-        "traffic": {0: "batch"},
-        "h0":      {0: "batch"},
-        "supercombo": {0: "batch"},
-    }
-
-    # export
     torch.onnx.export(
-        model_cpu,
-        (imgs12, desire, traffic, h0),
+        model,
+        (imgs, desire, traffic, h0),
         onnx_path,
-        input_names=["imgs12", "desire", "traffic", "h0"],
-        output_names=["supercombo"],
-        dynamic_axes=dynamic_axes,
-        opset_version=opset,
+        export_params=True,
+        opset_version=17,
         do_constant_folding=True,
-        verbose=False,
+        training=torch.onnx.TrainingMode.EVAL,
+        input_names=["input_imgs", "desire", "traffic_convention", "initial_state"],
+        output_names=["outputs"],
     )
-
     # write JSON sidecar with flip metadata + logs
     meta = {
         "arch": model.__class__.__name__,
