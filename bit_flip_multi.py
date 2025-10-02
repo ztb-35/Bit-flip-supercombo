@@ -413,7 +413,7 @@ def export_flipped_model_onnx(model: nn.Module,
         onnx_path,
         export_params=True,
         opset_version=17,
-        do_constant_folding=True,
+        do_constant_folding=False,
         training=torch.onnx.TrainingMode.EVAL,
         input_names=["input_imgs", "desire", "traffic_convention", "initial_state"],
         output_names=["outputs"],
@@ -558,6 +558,6 @@ def main():
 
 if __name__ == "__main__":
     args = parse_args()
-    for i in range(32):
+    for i in range(1):
         args.bits = str(i)
         main()
